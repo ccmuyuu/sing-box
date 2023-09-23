@@ -83,6 +83,7 @@
         ],
         "clash_mode": "direct",
         "invert": false,
+        "skip_resolve": false,
         "outbound": "direct"
       },
       {
@@ -90,6 +91,7 @@
         "mode": "and",
         "rules": [],
         "invert": false,
+        "skip_resolve": false,
         "outbound": "direct"
       }
     ]
@@ -234,6 +236,10 @@
 #### invert
 
 反选匹配结果。
+
+#### skip_resolve
+
+跳过域名解析。
 
 #### outbound
 
