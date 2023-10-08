@@ -31,8 +31,8 @@ var (
 
 type URLTest struct {
 	myOutboundAdapter
+	myGroupAdapter
 	ctx                          context.Context
-	tags                         []string
 	link                         string
 	interval                     time.Duration
 	tolerance                    uint16
@@ -49,16 +49,29 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 			tag:          tag,
 			dependencies: options.Outbounds,
 		},
+		myGroupAdapter: myGroupAdapter{
+			tags:      options.Outbounds,
+			uses:      options.Providers,
+			includes:  options.Includes,
+			excludes:  options.Excludes,
+			types:     options.Types,
+			ports:     make(map[int]bool),
+			providers: make(map[string]adapter.OutboundProvider),
+		},
 		ctx:                          ctx,
-		tags:                         options.Outbounds,
 		link:                         options.URL,
 		interval:                     time.Duration(options.Interval),
 		tolerance:                    options.Tolerance,
 		interruptExternalConnections: options.InterruptExistConnections,
 	}
-	if len(outbound.tags) == 0 {
-		return nil, E.New("missing tags")
+	if len(outbound.tags) == 0 && len(outbound.uses) == 0 {
+		return nil, E.New("missing tags and uses")
 	}
+	portMap, err := CreatePortsMap(options.Ports)
+	if err != nil {
+		return nil, err
+	}
+	outbound.ports = portMap
 	return outbound, nil
 }
 
@@ -69,16 +82,56 @@ func (s *URLTest) Network() []string {
 	return s.group.Select(N.NetworkTCP).Network()
 }
 
-func (s *URLTest) Start() error {
-	outbounds := make([]adapter.Outbound, 0, len(s.tags))
+func (s *URLTest) PickOutbounds() ([]adapter.Outbound, error) {
+	outbounds := []adapter.Outbound{}
 	for i, tag := range s.tags {
 		detour, loaded := s.router.Outbound(tag)
 		if !loaded {
-			return E.New("outbound ", i, " not found: ", tag)
+			return nil, E.New("outbound ", i, " not found: ", tag)
 		}
 		outbounds = append(outbounds, detour)
 	}
+	for i, tag := range s.uses {
+		provider, loaded := s.router.OutboundProvider(tag)
+		if !loaded {
+			return nil, E.New("provider ", i, " not found: ", tag)
+		}
+		if _, ok := s.providers[tag]; !ok {
+			s.providers[tag] = provider
+		}
+		for _, outbound := range provider.Outbounds() {
+			if s.OutboundFilter(outbound) {
+				outbounds = append(outbounds, outbound)
+			}
+		}
+	}
+	if len(outbounds) == 0 {
+		OUTBOUNDLESS, _ := s.router.Outbound("OUTBOUNDLESS")
+		outbounds = append(outbounds, OUTBOUNDLESS)
+	}
+	return outbounds, nil
+}
+
+func (s *URLTest) Start() error {
+	outbounds, err := s.PickOutbounds()
+	if err != nil {
+		return err
+	}
 	s.group = NewURLTestGroup(s.ctx, s.router, s.logger, outbounds, s.link, s.interval, s.tolerance, s.interruptExternalConnections)
+	return nil
+}
+
+func (s *URLTest) UpdateOutbounds(tag string) error {
+	if _, ok := s.providers[tag]; ok {
+		s.group.access.Lock()
+		defer s.group.access.Unlock()
+		outbounds, err := s.PickOutbounds()
+		if err != nil {
+			return E.New("update outbounds failed: ", s.tag, ", with reason: ", err)
+		}
+		s.group.outbounds = outbounds
+		s.group.performUpdateCheck()
+	}
 	return nil
 }
 
@@ -98,7 +151,11 @@ func (s *URLTest) Now() string {
 }
 
 func (s *URLTest) All() []string {
-	return s.tags
+	all := []string{}
+	for _, outbound := range s.group.outbounds {
+		all = append(all, outbound.Tag())
+	}
+	return all
 }
 
 func (s *URLTest) URLTest(ctx context.Context, link string) (map[string]uint16, error) {
@@ -233,7 +290,7 @@ func (g *URLTestGroup) Close() error {
 func (g *URLTestGroup) Select(network string) adapter.Outbound {
 	var minDelay uint16
 	var minTime time.Time
-	var minOutbound adapter.Outbound
+	minOutbound := g.outbounds[0]
 	for _, detour := range g.outbounds {
 		if !common.Contains(detour.Network(), network) {
 			continue
@@ -306,6 +363,8 @@ func (g *URLTestGroup) URLTest(ctx context.Context, link string) (map[string]uin
 
 func (g *URLTestGroup) urlTest(ctx context.Context, link string, force bool) (map[string]uint16, error) {
 	result := make(map[string]uint16)
+	g.access.Lock()
+	defer g.access.Unlock()
 	if g.checking.Swap(true) {
 		return result, nil
 	}
@@ -324,7 +383,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, link string, force bool) (ma
 			continue
 		}
 		checked[realTag] = true
-		p, loaded := g.router.Outbound(realTag)
+		p, loaded := g.router.OutboundWithProvider(realTag)
 		if !loaded {
 			continue
 		}
